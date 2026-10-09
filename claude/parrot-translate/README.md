@@ -6,6 +6,56 @@ Claude 的英文回复在后台翻成你配置的语言，译文跟在对应的�
 
 译文和对照都只在显示层，整个对话上下文里始终只有英文。
 
+## 安装与更新
+
+需要 Claude Code v2.1.287+（mods API）。
+
+### 安装
+
+```bash
+claude plugin marketplace add ryocoooool/parrot-agent-extensions
+claude plugin install parrot-translate@parrot-agent-extensions
+```
+
+marketplace 名是 `parrot-agent-extensions`，与上游 `jhao0413/parrot-agent-extensions` 同名。之前添加过上游的，先移除再添加，否则装到的是上游版本：
+
+```bash
+claude plugin marketplace remove parrot-agent-extensions
+```
+
+装好后在新会话里生效。配置键是 `parrot-translate@parrot-agent-extensions`，见下面的「配置」。
+
+### 更新
+
+先刷新 marketplace，再更新插件，然后重开会话：
+
+```bash
+claude plugin marketplace update parrot-agent-extensions
+claude plugin update parrot-translate@parrot-agent-extensions
+```
+
+0.2.0 起 `show_by_default` 被 `display` 取代：原来设为 `false` 的，改成 `"display": "english"`。
+
+### 本地开发
+
+改仓库里的代码时，不用安装，直接从目录加载（改动在下次启动生效）：
+
+```bash
+claude --plugin-dir /path/to/parrot-agent-extensions/claude/parrot-translate
+```
+
+这种方式的配置键是 `parrot-translate@inline`。和 marketplace 版同时启用时会加载两份，测试时先 `claude plugin disable parrot-translate@parrot-agent-extensions`。
+
+### 发布新版本
+
+1. 改 `.claude-plugin/plugin.json` 的 `version`（已安装的机器靠版本号识别更新，不改可能拿不到新代码）
+2. 跑测试和校验：
+   ```bash
+   (cd pi && npm install && npm test)
+   claude plugin validate .
+   ```
+3. 提交并推送到 `main`，其他机器按上面的「更新」执行
+
 ## 配置
 
 `/config` 面板可以直接改，或者改 `~/.claude/settings.json`（键名与安装方式对应，marketplace 装的就是 `@parrot-agent-extensions`）：

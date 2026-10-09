@@ -15,11 +15,18 @@ pi install npm:pi-parrot-translate
 ## Claude Code 安装
 
 ```bash
-claude plugin marketplace add jhao0413/parrot-agent-extensions
+claude plugin marketplace add ryocoooool/parrot-agent-extensions
 claude plugin install parrot-translate@parrot-agent-extensions
 ```
 
-需要 Claude Code v2.1.287+（mods API）。完整说明见 [Claude Code 安装与使用](claude/parrot-translate/README.md)。
+更新：
+
+```bash
+claude plugin marketplace update parrot-agent-extensions
+claude plugin update parrot-translate@parrot-agent-extensions
+```
+
+需要 Claude Code v2.1.287+（mods API）。如果之前添加过上游的同名 marketplace，先 `claude plugin marketplace remove parrot-agent-extensions` 再添加。完整说明（含本地开发加载、发布新版本）见 [Claude Code 安装与使用](claude/parrot-translate/README.md#安装与更新)。
 
 ## 使用说明
 
