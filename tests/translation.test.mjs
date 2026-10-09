@@ -17,7 +17,8 @@ function load(runtime, options = {}) {
     ? implementation.replace('\tloadConfig()', `\tObject.assign(exports, { ${symbols} });\n\tloadConfig()`)
     : implementation + `\nexport { ${symbols}, scheduleOne, translateBlock };`
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
-  const calls = [], notices = [], logs = [], components = [], hooks = new Map(), commands = new Map()
+  const calls = [], notices = [], logs = [], components = [], timers = [], hooks = new Map(), commands = new Map()
+  const box = { text: '' }
   let transformer
   const answer = options.answer ?? ((text) => `译文：${text}`)
   const fetchMock = async (_url, init) => {
@@ -32,6 +33,7 @@ function load(runtime, options = {}) {
   }
   const sandbox = {
     exports: {}, URLSearchParams, AbortSignal, AbortController, fetch: fetchMock,
+    h: (tag, props, ...children) => ({ tag: tag.name, props, children }),
     require: (id) => id === '@earendil-works/pi-coding-agent' ? { getAgentDir: () => '/test-agent' }
       : id === 'node:fs' ? { readFileSync: () => JSON.stringify(config) }
       : id === 'node:fs/promises' ? { writeFile: async (_path, text) => logs.push(text) } : require(id),
@@ -61,7 +63,14 @@ function load(runtime, options = {}) {
   const $ = {
     model: { complete: async ({ system, prompt }) => ({ isAnswered: true, text: await modelAnswer(system, prompt) }) },
     fs: { write: async (_path, text) => logs.push(text) },
-    ui: { toast: (message) => notices.push(message), invalidate() {} },
+    // Timers fire on the next macrotask; the requested delays are recorded for assertions.
+    clock: { after: (ms, fn) => { timers.push(ms); const t = setTimeout(fn, 0); return { cancel: () => clearTimeout(t) } } },
+    command: { register: async () => {} },
+    prompt: {
+      read: async () => ({ text: box.text, cursor: box.text.length }),
+      fill: async ({ text }) => { box.text = text; return { isFilled: true, text, cursor: text.length } },
+    },
+    ui: { toast: (message) => notices.push(message), invalidate() {}, resolve: () => ({ Box: function Box() {}, Text: function Text() {}, Input: function Input() {} }) },
     process: { run: async (args) => {
       const body = args[args.indexOf('--data-binary') + 1]
       const response = await fetchMock('mock', { body })
@@ -76,13 +85,19 @@ function load(runtime, options = {}) {
     registerShortcut() {}, registerCommand: (name, command) => commands.set(name, command),
     registerMarkdownTransformer: (fn) => { transformer = fn }, on: (name, handler) => hooks.set(name, handler),
   })
-  else sandbox.exports.register((name, ...args) => hooks.set(name, args.at(-1)), config)
-  return { ...sandbox.exports, hooks, commands, ctx, $, calls, notices, logs, components,
+  else sandbox.exports.register((name, ...args) => {
+    hooks.set(name, args.at(-1))
+    const key = args.length > 1 && (args[0].component ?? args[0].command)
+    if (key) hooks.set(`${name}:${key}`, args.at(-1))
+  }, config)
+  return { ...sandbox.exports, hooks, commands, ctx, $, calls, notices, logs, components, timers, box,
     transform: (text, messageType = 'assistant', isStreaming = false) => transformer(text, { messageType, isStreaming, availableWidth: 100 }),
   }
 }
 
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate) }
+/** Lets mocked $.clock timers (next macrotask) and the work they start finish. */
+const settle = async () => { await new Promise(resolve => setTimeout(resolve, 5)); await flush() }
 const context = (runtime, h) => runtime === 'pi' ? h.ctx : h.$
 const noChangeCommentary = 'The prompt is already in natural, grammatically correct English. No changes are needed.'
 
@@ -724,4 +739,231 @@ test('Claude: a failed reply records error rather than skip/readiness', async ()
   assert.ok(!h.notices.includes('译文就绪'))
   assert.match(h.logs.at(-1), /state=error/)
   assert.match(h.logs.at(-1), /provider offline/)
+})
+
+/* ---------------- Prompt box helpers (Claude Code plugin) ---------------- */
+
+const edit = (h, text) => h.hooks.get('prompt.edit')(h.$, { text: h.box.text, origin: { kind: 'composer' } }, () => {
+  h.box.text = text
+  return { text, cursor: text.length }
+})
+const renderUser = (h, text) => h.hooks.get('ui.render:UserMessage')(h.$, { props: { text } }, e => e.props.text)
+
+/* ---------------- Live preview while typing (Claude Code plugin) ---------------- */
+
+const treeText = node => typeof node === 'string' ? node : (node?.children ?? []).map(treeText).join('')
+const bandTree = h => h.hooks.get('ui.render:AbovePrompt')(h.$, { props: { hasSurvey: false } }, () => 'ENGINE')
+/** The band's first line: the editable field once translated, otherwise the status text. */
+const band = async h => {
+  const r = await bandTree(h)
+  if (r === 'ENGINE') return null
+  const first = r.children[0]
+  return first.tag === 'Input' ? first.props.label + first.props.value : treeText(first)
+}
+const bandInput = async h => (await bandTree(h)).children.find(child => child.tag === 'Input')?.props
+
+test('Claude: typing foreign text shows the English above the prompt and Enter sends it as shown', async () => {
+  const h = load('claude', { answer: text => text.replace('请检查这个修改', 'Please review these changes.') })
+  await edit(h, '请')
+  await edit(h, '请检查')
+  await edit(h, '请检查这个修改')
+  assert.equal(await band(h), 'EN ▸ 翻译中…')
+  await settle()
+  assert.equal(h.calls.length, 1, 'rapid keystrokes are debounced into one request')
+  assert.equal(h.calls[0].text, '请检查这个修改')
+  assert.ok(h.timers.includes(800))
+  assert.equal(await band(h), 'EN ▸ Please review these changes.')
+
+  assert.equal(await submit('claude', h, '请检查这个修改'), 'Please review these changes.')
+  assert.equal(h.calls.length, 1, 'the previewed English is reused on submit')
+  assert.equal(await renderUser(h, 'Please review these changes.'), '请检查这个修改\n\n> Please review these changes.')
+  assert.equal(await band(h), null, 'the band clears after sending')
+})
+
+test('Claude: live preview skips English, slash commands and empty drafts', async () => {
+  const h = load('claude')
+  for (const text of ['Please review this.', '/translate 请', '   ', 'Run `你好` now']) {
+    await edit(h, text)
+    await settle()
+    assert.equal(await band(h), null, text)
+  }
+  assert.equal(h.calls.length, 0)
+})
+
+test('Claude: one live request runs at a time and the latest draft wins', async () => {
+  const releases = []
+  const h = load('claude', { answer: text => new Promise(resolve => releases.push(() => resolve(text.replace('请检查', 'Review')))) })
+  await edit(h, '请检查 A')
+  await settle()
+  await edit(h, '请检查 AB')
+  await settle()
+  assert.equal(h.calls.length, 1, 'no second request while one is in flight')
+  releases.shift()()
+  await settle()
+  assert.equal(h.calls.length, 2)
+  assert.equal(h.calls[1].text, '请检查 AB')
+  assert.equal(await band(h), 'EN ▸ Review A …', 'the previous English stays visible while the next is pending')
+  releases.shift()()
+  await settle()
+  assert.equal(await band(h), 'EN ▸ Review AB')
+  await edit(h, '请检查 A')
+  await settle()
+  assert.equal(h.calls.length, 2, 'returning to a translated draft uses the cache')
+  assert.equal(await band(h), 'EN ▸ Review A')
+})
+
+test('Claude: live preview failures are shown and Enter still retries normally', async () => {
+  let offline = true
+  const h = load('claude', { answer: () => { if (offline) throw new Error('provider offline'); return 'Please review.' } })
+  await edit(h, '请检查')
+  await settle()
+  assert.match(await band(h), /英文预览失败/)
+  offline = false
+  assert.equal(await submit('claude', h, '请检查'), 'Please review.')
+})
+
+test('Claude: live preview can be disabled', async () => {
+  const h = load('claude', { config: { live_preview: false } })
+  await edit(h, '请检查')
+  await settle()
+  assert.equal(await band(h), null)
+  assert.equal(h.calls.length, 0)
+})
+
+test('Claude: the translated preview is an editable field; edits are what Enter sends', async () => {
+  const h = load('claude', { answer: () => 'Please review these changes.' })
+  await edit(h, '请检查这个修改')
+  await settle()
+  const field = await bandInput(h)
+  assert.equal(field.value, 'Please review these changes.')
+  assert.equal(field.autoFocus, true, 'ctrl+x tab lands in the field')
+  assert.match(treeText((await bandTree(h)).children[1]), /ctrl\+x tab/)
+
+  field.onInput('Please carefully review these changes.')
+  assert.equal((await bandInput(h)).value, 'Please carefully review these changes.', 'edits survive a redraw')
+  assert.equal(await submit('claude', h, '请检查这个修改'), 'Please carefully review these changes.')
+  assert.equal(h.calls.length, 1, 'the edited English is sent without another request')
+  assert.equal(await renderUser(h, 'Please carefully review these changes.'), '请检查这个修改\n\n> Please carefully review these changes.')
+})
+
+test('Claude: Enter in the preview field fills the prompt box for a final check', async () => {
+  const h = load('claude', { answer: text => /[一-鿿]/.test(text) ? 'Please review this.' : text })
+  await edit(h, '请检查')
+  await settle()
+  ;(await bandInput(h)).onSubmit('Please review this file.')
+  await flush()
+  assert.equal(h.box.text, 'Please review this file.')
+  assert.equal(await band(h), null, 'the band closes once the box holds English')
+  assert.ok(h.notices.includes('英文已填入输入框，回车发送'))
+
+  await edit(h, 'Please review this file again.')
+  assert.equal(await submit('claude', h, h.box.text), 'Please review this file again.', 'the filled English is sent as edited')
+  assert.equal(h.calls.length, 1, 'a reviewed prompt is never rewritten again')
+  assert.equal(await renderUser(h, 'Please review this file again.'), '请检查\n\n> Please review this file again.')
+  assert.equal(await submit('claude', h, 'Looks good'), 'Looks good')
+  assert.equal(h.calls.length, 2, 'the filled preview applies to one submission only')
+})
+
+test('Claude: filled previews are abandoned when the box is cleared or gains foreign text', async () => {
+  const h = load('claude', { answer: text => /[一-鿿]/.test(text) ? 'Please review this.' : text })
+  await edit(h, '请检查')
+  await settle()
+  ;(await bandInput(h)).onSubmit('Please review this.')
+  await flush()
+  await edit(h, '')
+  await edit(h, 'fix all')
+  assert.equal(await submit('claude', h, 'fix all'), 'fix all')
+  assert.equal(await renderUser(h, 'fix all'), 'fix all', 'it cannot inherit the abandoned original')
+
+  await edit(h, '请检查')
+  ;(await bandInput(h)).onSubmit('Please review this.')
+  await flush()
+  await edit(h, 'Please review this. 还有测试')
+  assert.equal(await submit('claude', h, h.box.text), 'Please review this.', 'foreign text added while editing is translated on submit')
+})
+
+test('Claude: editing the source draft replaces a hand-edited preview', async () => {
+  const h = load('claude', { answer: text => text.replace('请检查', 'Review') })
+  await edit(h, '请检查 A')
+  await settle()
+  ;(await bandInput(h)).onInput('My own wording')
+  await edit(h, '请检查 B')
+  await settle()
+  assert.equal((await bandInput(h)).value, 'Review B')
+  assert.equal(await submit('claude', h, '请检查 B'), 'Review B')
+})
+
+test('Claude: with outbound off only a hand-edited preview is sent as English', async () => {
+  const h = load('claude', { config: { outbound: false }, answer: () => 'Please review this.' })
+  await edit(h, '请检查')
+  await settle()
+  assert.equal(await submit('claude', h, '请检查'), '请检查', 'an untouched preview does not override outbound=false')
+  await edit(h, '请检查')
+  ;(await bandInput(h)).onInput('Please review this now.')
+  assert.equal(await submit('claude', h, '请检查'), 'Please review this now.')
+  assert.equal(await renderUser(h, 'Please review this now.'), '请检查\n\n> Please review this now.')
+})
+
+/* ---------------- Page display modes via /translate (Claude Code plugin) ---------------- */
+
+const display = (h, args = '') => h.hooks.get('command.run:translate')(h.$, { command: 'translate', args })
+const renderReply = (h, text) => h.hooks.get('ui.render:AssistantMessage')(h.$, { props: { text } }, e => e.props.text)
+
+async function conversation(config = {}) {
+  const h = load('claude', { config, answer: text => text === '请检查这个修改' ? 'Please review these changes.'
+    : text.replace('Here is the plan.', '这是计划。').replace('Then run the tests.', '然后运行测试。') })
+  const sent = await submit('claude', h, '请检查这个修改')
+  const reply = 'Here is the plan.\n\n```sh\nnpm test\n```\n\nThen run the tests.'
+  await renderReply(h, reply)
+  await settle()
+  return { h, sent, reply }
+}
+
+test('Claude: /translate cycles prompts and replies together through three display modes', async () => {
+  const { h, sent, reply } = await conversation()
+  assert.equal(sent, 'Please review these changes.', 'the conversation always receives English')
+  const page = async () => [await renderUser(h, sent), await renderReply(h, reply)]
+
+  assert.deepEqual(await page(), [
+    '请检查这个修改\n\n> Please review these changes.',
+    'Here is the plan.\n\n> 这是计划。\n\n```sh\nnpm test\n```\n\nThen run the tests.\n\n> 然后运行测试。',
+  ])
+  await display(h)
+  assert.deepEqual(await page(), ['请检查这个修改', '这是计划。\n\n```sh\nnpm test\n```\n\n然后运行测试。'])
+  assert.ok(h.notices.includes('显示：只显示中文'))
+  await display(h)
+  assert.deepEqual(await page(), [sent, reply])
+  assert.ok(h.notices.includes('显示：只显示英文'))
+  await display(h)
+  assert.equal((await page())[0], '请检查这个修改\n\n> Please review these changes.')
+  assert.ok(h.notices.includes('显示：双语对照'))
+
+  await display(h, 'Native')
+  assert.deepEqual(await page(), ['请检查这个修改', '这是计划。\n\n```sh\nnpm test\n```\n\n然后运行测试。'])
+  assert.match((await display(h, 'chinese')).text, /用法/)
+  assert.equal((await page())[0], '请检查这个修改', 'an invalid argument keeps the mode')
+})
+
+test('Claude: display sets the initial mode; untranslated content always shows as-is', async () => {
+  const { h, sent, reply } = await conversation({ display: 'english' })
+  assert.equal(await renderUser(h, sent), sent)
+  assert.equal(await renderReply(h, reply), reply)
+  assert.ok(h.calls.length > 1, 'replies are still translated in the background while hidden')
+
+  await display(h, 'native')
+  assert.equal(await renderUser(h, 'An untranslated prompt.'), 'An untranslated prompt.')
+  const mixed = '已经是中文的段落。\n\nThen run the tests.'
+  await renderReply(h, mixed)
+  await settle()
+  assert.equal(await renderReply(h, mixed), '已经是中文的段落。\n\n然后运行测试。', 'paragraphs already in the target language are kept')
+})
+
+test('Claude: an English line with two different originals is never relabelled in any mode', async () => {
+  const h = load('claude', { answer: () => 'Hello' })
+  await submit('claude', h, '你好')
+  await submit('claude', h, '您好')
+  for (const m of ['both', 'native', 'english']) {
+    await display(h, m)
+    assert.equal(await renderUser(h, 'Hello'), 'Hello', m)
+  }
 })

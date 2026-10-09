@@ -1,15 +1,18 @@
 /**
  * parrot-translate — Claude 的英文回复自动翻成配置的目标语言；发出的提示词保证是地道英文。
  *
- * 行为：回复稳定约 1.5s 后后台翻好缓存；快捷键（Ctrl+Y）切换显示。
- * 逐段穿插：每段原文下面直接跟它自己的 `> ` 译文。
+ * 行为：回复稳定约 1.5s 后后台翻好缓存；/translate（可绑快捷键）在三种显示方式间切换，
+ * 同时作用于用户消息和回复：双语对照（逐段穿插 `> ` 译文）/ 只显示你的语言 / 只显示英文。
  * 出站：prompt.submit 时把提示词改写成英文（其他语言忠实翻译；英文只修语法，
  * 不改意思），模型与 transcript 收到的都是英文；用户消息行渲染成双语对照。
  * 粘贴的技术性内容（错误信息/堆栈/JSON/日志/diff）两侧都不送翻，原样放行。
+ * 实时预览：输入含外文时停顿 0.8s 后台翻译，输入框上方显示可编辑的英文（ctrl+x tab 进入）；
+ * 回车发出的就是这份英文（含手改），不再二次请求。
  *
  * 翻译服务（/config 里换，见 plugin.json 的 userConfig）：
  *  - microsoft（默认）：Edge 免费接口（与 parrot 扩展同款），无需 key
  *  - session：$.model.complete 走本会话凭证跑一次独立补全（默认 haiku），免配置、质量更好、耗 token
+ *  - openai：OpenAI 兼容接口（本地 llama.cpp 等）
  *
  * 注：hooks module 只能 import 相对路径和 "claude-code"，所以没有外部依赖。
  */
@@ -19,12 +22,19 @@ const MAX_TOKENS = 16_000 // 单次补全输出上限：3000 字符块的重写�
 const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
 
 /** userConfig 传入的配置（register 时初始化） */
-const cfg = { showByDefault: false, outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '' }
+const cfg = { display: 'both', outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '', livePreview: true }
 
-/** 显示开关（快捷键翻转；初始值来自 showByDefault 配置） */
-let show = false
+/**
+ * 页面显示方式（/translate 循环切换；初始值来自 display 配置），用户消息与回复共用：
+ *  - both：双语对照（用户消息：原文 + 发出的英文；回复：英文 + 译文）
+ *  - native：只显示你的语言（用户消息：原文；回复：译文）
+ *  - english：只显示英文（模型实际看到的内容）
+ */
+const DISPLAY_MODES = ['both', 'native', 'english']
+let mode = 'both'
+const modeLabel = (m) => m === 'both' ? '双语对照' : m === 'english' ? '只显示英文' : /^zh/i.test(cfg.lang) ? '只显示中文' : `只显示${langName()}`
 
-/** 原文 -> { state: 'pending'|'done'|'skip'|'error', md? }，按消息块缓存 */
+/** 原文 -> { state: 'pending'|'done'|'skip'|'error', md?, native? }，按消息块缓存 */
 const cache = new Map()
 
 /** 发出的英文 -> 用户原话：UserMessage 渲染层做双语对照（不落盘、不进上下文） */
@@ -335,7 +345,7 @@ function preserveWhitespace(source, replacement) {
 function quoteTranslation(text, translation) {
   const trailing = text.match(/\s*$/)?.[0] ?? ""
   return text.slice(0, text.length - trailing.length) + "\n\n" +
-    translation.split("\n").map((line) => `> ${line}`).join("\n") + trailing
+    translation.trimEnd().split("\n").map((line) => `> ${line}`).join("\n") + trailing
 }
 
 const fetchOne = ($, text, opts = {}) =>
@@ -389,19 +399,12 @@ async function translateBlock($, text) {
     }
   })
 
-  let any = false
-  let errors = 0
-  const md = paras.map((p) => {
-    if (p.code !== undefined) return p.code
-    if (p.separator !== undefined) return p.separator
-    if (p.error) errors++
-    if (p.translation) {
-      any = true
-      return quoteTranslation(p.text, p.translation)
-    }
-    return p.text
-  }).join('')
-  return { md: any ? md : null, errors }
+  const errors = paras.filter((p) => p.error).length
+  if (!paras.some((p) => p.translation)) return { md: null, native: null, errors }
+  // md 双语逐段穿插；native 只留译文（没译的段——已是目标语言/技术内容/失败——保留原文）
+  const md = paras.map((p) => p.code ?? p.separator ?? (p.translation ? quoteTranslation(p.text, p.translation) : p.text)).join('')
+  const native = paras.map((p) => p.code ?? p.separator ?? p.translation ?? p.text).join('')
+  return { md, native, errors }
 }
 
 /* ---------------- 出站：保证发给模型的一定是英文 ---------------- */
@@ -615,11 +618,11 @@ function scheduleOne($, text) {
   putCapped(cache, text, { state: 'pending' })
   diag($, `schedule len=${text.length}`)
   translateBlock($, text)
-    .then(({ md, errors }) => {
+    .then(({ md, native, errors }) => {
       const state = md ? 'done' : errors ? 'error' : 'skip'
-      putCapped(cache, text, { state, md, errors })
+      putCapped(cache, text, { state, md, native, errors })
       diag($, `done len=${text.length} state=${state} errors=${errors}${md ? ' md=' + md.length : ''}`)
-      if (show) {
+      if (mode !== 'english') {
         $.ui.invalidate('ui.render')
         if (state === 'done' && errors) $.ui.toast(`部分译文就绪（${errors} 段失败，见 /tmp/pt-live.log）`)
         else if (state === 'done') $.ui.toast('译文就绪')
@@ -629,8 +632,94 @@ function scheduleOne($, text) {
     .catch((err) => {
       putCapped(cache, text, { state: 'error', errors: 1 })
       diag($, `error len=${text.length}: ${String((err && err.message) || err).slice(0, 150)}`)
-      if (show) $.ui.toast('翻译失败，见 /tmp/pt-live.log')
+      if (mode !== 'english') $.ui.toast('翻译失败，见 /tmp/pt-live.log')
     })
+}
+
+/** 从预览框填回输入框的英文 { orig }：下一次回车原样发出（用户可能又改过），不再二次改写 */
+let preview = null
+
+/* ---------------- 实时预览：输入时在输入框上方显示英文 ---------------- */
+
+const LIVE_DEBOUNCE = 800
+/** 草稿 -> outboundBlock 结果 + state（done / same / error）；回车时命中就不再请求 */
+const liveCache = new Map()
+let liveDraft = '' // 正在预览的草稿；空 = 不显示
+let liveLast = '' // 最近一次译好的英文：新译文出来前先显示它，免得闪烁
+let liveTimer = null
+let liveRunning = false
+
+/** 只预览含非拉丁文字的草稿（纯英文无需翻译）；斜杠命令不预览 */
+function onDraftEdit($, text) {
+  const wanted = cfg.livePreview && !text.trimStart().startsWith('/') && nonLatinLetterCount(text) ? text : ''
+  if (wanted === liveDraft) return
+  const wasShown = !!liveDraft
+  liveDraft = wanted
+  if (!wanted) liveLast = ''
+  if (liveTimer) { liveTimer.cancel(); liveTimer = null }
+  if (wanted && !liveCache.has(wanted)) armLive($)
+  if (wanted || wasShown) $.ui.invalidate('ui.render')
+}
+
+function armLive($) {
+  liveTimer = $.clock.after(LIVE_DEBOUNCE, () => { liveTimer = null; runLive($) })
+}
+
+/** 同一时间只跑一次翻译（省额度）；跑完草稿又变了就重新防抖 */
+async function runLive($) {
+  if (liveRunning || !liveDraft || liveCache.has(liveDraft)) return
+  liveRunning = true
+  const draft = liveDraft
+  try {
+    const r = await outboundBlock($, draft)
+    const state = r.changed && r.text.trim() ? 'done' : r.errors ? 'error' : 'same'
+    putCapped(liveCache, draft, { ...r, state })
+    if (state === 'done' && liveDraft) liveLast = r.text
+  } catch (err) {
+    putCapped(liveCache, draft, { state: 'error' })
+    diag($, `live error: ${String((err && err.message) || err).slice(0, 150)}`)
+  } finally {
+    liveRunning = false
+  }
+  if (draft === liveDraft) $.ui.invalidate('ui.render')
+  else if (liveDraft && !liveCache.has(liveDraft) && !liveTimer) armLive($)
+}
+
+function clearLive($) {
+  onDraftEdit($, '')
+}
+
+/** 预览框里回车：把（手改过的）英文填进输入框，再回车原样发出 */
+async function fillFromLive($, draft, value) {
+  if (!value.trim()) return
+  const filled = await $.prompt.fill({ text: value, mode: 'replace' })
+  if (!filled.isFilled) return
+  preview = { orig: draft }
+  clearLive($)
+  diag($, `live fill len=${draft.length} -> ${value.length}`)
+  $.ui.toast('英文已填入输入框，回车发送')
+}
+
+function renderLive($, e, next) {
+  if (!liveDraft || e.props?.hasSurvey) return next(e)
+  const draft = liveDraft
+  const r = liveCache.get(draft)
+  const { Box, Text, Input } = $.ui.resolve(e)
+  if (r?.state === 'done' && Input) {
+    // 手改随打随存进缓存：Esc 回输入框直接回车，发出的就是改过的英文
+    const hint = `ctrl+x tab 编辑英文 · 框内回车填入输入框 · Esc 返回${r.errors ? ` · ${r.errors} 段翻译失败，保留原文` : ''}`
+    return h(Box, { flexDirection: 'column' },
+      h(Input, {
+        key: 'live-en', label: 'EN ▸ ', value: r.text, submitLabel: '填入输入框', autoFocus: true,
+        onInput: (value) => { putCapped(liveCache, draft, { ...r, text: value, edited: true }) },
+        onSubmit: (value) => { void fillFromLive($, draft, value) },
+      }),
+      h(Text, { dimColor: true }, hint))
+  }
+  const body = !r ? (liveLast ? `${liveLast} …` : '翻译中…')
+    : r.state === 'done' ? r.text
+      : r.state === 'same' ? '（无需翻译，原样发送）' : '（英文预览失败，见 /tmp/pt-live.log）'
+  return h(Box, null, h(Text, { dimColor: true }, `EN ▸ ${body}`))
 }
 
 function onRenderText($, text) {
@@ -650,9 +739,16 @@ export function register(on, options) {
   seen.clear()
   cache.clear()
   outboundMap.clear()
+  preview = null
+  if (liveTimer) liveTimer.cancel()
+  liveTimer = null
+  liveCache.clear()
+  liveDraft = ''
+  liveLast = ''
+  liveRunning = false
 
   // userConfig（/config 面板或 settings.json 的 pluginConfigs["parrot-translate@inline"]）
-  cfg.showByDefault = options?.show_by_default !== false // 默认 true（0.4.3 起）
+  cfg.display = DISPLAY_MODES.includes(options?.display) ? options.display : 'both'
   cfg.outbound = options?.outbound !== false
   cfg.lang = typeof options?.lang === 'string' && options.lang.trim() ? options.lang.trim() : 'zh-Hans'
   // 旧值 model（≤0.4.1）兼容：映射为 session
@@ -661,28 +757,27 @@ export function register(on, options) {
   cfg.model = typeof options?.model === 'string' && options.model.trim() ? options.model.trim() : 'haiku'
   cfg.baseUrl = typeof options?.base_url === 'string' && options.base_url.trim() ? options.base_url.trim() : 'http://127.0.0.1:8021/v1'
   cfg.apiKey = typeof options?.api_key === 'string' ? options.api_key : ''
-  show = cfg.showByDefault
+  cfg.livePreview = options?.live_preview !== false
+  mode = cfg.display
 
   on('session.start', async ($, e, next) => {
     outboundMap.clear()
-    await $.command.register({ name: 'translate', description: 'Show/hide translation of replies' })
-    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} showByDefault=${cfg.showByDefault} outbound=${cfg.outbound} lang=${cfg.lang}`)
+    preview = null
+    await $.command.register({ name: 'translate', description: 'Cycle the display of prompts and replies: bilingual, your language only, English only', argumentHint: '[both|native|english]' })
+    diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} display=${cfg.display} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
   })
 
-  on('command.run', { command: 'translate' }, async ($) => {
-    show = !show
-    diag($, `toggle show=${show}`)
-    if (show) {
-      // 等待反馈：还有段在翻时直接告诉用户，免得对着空白狂按
-      const pending = [...cache.values()].filter((e) => e.state === 'pending').length
-      const error = [...cache.values()].filter((e) => e.state === 'error' || e.errors).length
-      if (pending) $.ui.toast(`翻译中（还有 ${pending} 块，本地模型较慢）…`)
-      else if (error) $.ui.toast('部分翻译失败，详见 /tmp/pt-live.log')
-      else $.ui.toast('译文：显示')
-    } else {
-      $.ui.toast('译文：隐藏')
-    }
+  on('command.run', { command: 'translate' }, async ($, e) => {
+    const arg = (e?.args || '').trim().toLowerCase()
+    if (arg && !DISPLAY_MODES.includes(arg)) return { text: `用法：/translate [${DISPLAY_MODES.join('|')}]` }
+    mode = arg || DISPLAY_MODES[(DISPLAY_MODES.indexOf(mode) + 1) % DISPLAY_MODES.length]
+    diag($, `display=${mode}`)
+    // 等待反馈：还有段在翻时直接告诉用户，免得对着空白狂按
+    const pending = [...cache.values()].filter((e) => e.state === 'pending').length
+    const error = [...cache.values()].filter((e) => e.state === 'error' || e.errors).length
+    const note = mode === 'english' ? '' : pending ? `（还有 ${pending} 块在翻译）` : error ? '（部分翻译失败，见 /tmp/pt-live.log）' : ''
+    $.ui.toast(`显示：${modeLabel(mode)}${note}`)
     $.ui.invalidate('ui.render')
     return {}
   })
@@ -696,23 +791,47 @@ export function register(on, options) {
     const entry = cache.get(text)
     if (!entry) onRenderText($, text)
 
-    if (!show) return next(e)
+    if (mode === 'english') return next(e)
 
-    // 诊断：show=true 时记录每次渲染到达，用于排查「切了显示但没重画」
+    // 诊断：显示译文时记录每次渲染到达，用于排查「切了显示但没重画」
     diag($, `render len=${text.length} state=${entry ? entry.state : 'none'}`)
     if (!entry || entry.state !== 'done') return next(e)
 
-    // 缓存里已是拼好的逐段穿插版本，直接替换显示文本（只影响渲染，不落盘不进上下文）
-    return next({ ...e, props: { ...e.props, text: entry.md } })
+    // 缓存里已拼好双语 / 纯译文两版，直接替换显示文本（只影响渲染，不落盘不进上下文）
+    return next({ ...e, props: { ...e.props, text: mode === 'native' ? entry.native : entry.md } })
   })
+
+  // 输入时更新实时预览；输入框清空即放弃已填入的英文预览（之后的提交回到自动改写）
+  on('prompt.edit', async ($, e, next) => {
+    const r = await next(e)
+    const text = r?.text ?? ''
+    if (!text.trim()) preview = null
+    onDraftEdit($, text)
+    return r
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => renderLive($, e, next))
 
   // 出站：本机敲 Enter 的提示词改写成英文再进会话（插件/peer/通知的提交不动）
   on('prompt.submit', { origin: { kind: 'composer' } }, async ($, e, next) => {
     const text = e.text ?? ''
-    if (!cfg.outbound || !text.trim() || text.startsWith('/')) return next(e)
+    if (text.startsWith('/')) return next(e)
+    const reviewed = preview
+    preview = null
+    const live = liveCache.get(text)
+    clearLive($)
+    // 预览过的英文（可能已手改）原样发出；改的时候又写进了非拉丁文字就照常走自动改写
+    if (reviewed && text.trim() && !nonLatinLetterCount(text)) {
+      if (text.trim() !== reviewed.orig.trim()) putOutboundMap(text, reviewed.orig)
+      diag($, `outbound reviewed len=${text.length}`)
+      return next(e)
+    }
+    // outbound 关掉时只认用户在预览框里手改过的英文（明确要发英文），不做自动改写
+    if ((!cfg.outbound && !live?.edited) || !text.trim()) return next(e)
     try {
-      if (cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
-      const { text: en, changed, errors } = await outboundBlock($, text)
+      // 实时预览已译好：发出的就是输入框上方显示的英文，不再请求
+      if (live?.state !== 'done' && cfg.provider !== 'microsoft' && text.length > 120) $.ui.toast('正在把提示词转成英文…')
+      const { text: en, changed, errors } = live?.state === 'done' ? live : await outboundBlock($, text)
       if (!changed || !en.trim()) {
         if (errors) $.ui.toast('提示词英文转换失败，已原样发送（见 /tmp/pt-live.log）')
         return next(e)
@@ -728,12 +847,14 @@ export function register(on, options) {
     }
   })
 
-  // 用户消息行的双语对照：原文在上，实际发出的英文 `> ` 引用在下（只影响渲染）
+  // 用户消息行：双语对照（原文在上，实际发出的英文 `> ` 引用在下）/ 只显示原文 / 只显示英文。
+  // 只影响渲染：上下文和 transcript 里始终是英文。
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     const text = e.props?.text
     const orig = text ? outboundMap.get(text) : undefined
-    if (orig === undefined || orig === null) return next(e)
+    if (orig === undefined || orig === null || mode === 'english') return next(e)
     const quote = text.split('\n').map((l) => `> ${l}`).join('\n')
-    return next({ ...e, props: { ...e.props, text: `${orig}\n\n${quote}` } })
+    const shown = mode === 'native' ? orig : `${orig}\n\n${quote}`
+    return next({ ...e, props: { ...e.props, text: shown } })
   })
 }
