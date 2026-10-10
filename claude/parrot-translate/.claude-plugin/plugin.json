@@ -1,6 +1,6 @@
 {
   "name": "parrot-translate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Translate Claude's English replies into the configured language (hotkey toggles); ensure outgoing prompts are natural English (translate or grammar-fix), shown bilingually",
   "author": { "name": "jhao" },
   "userConfig": {
@@ -20,8 +20,14 @@
     "live_preview": {
       "type": "boolean",
       "title": "输入时实时显示英文",
-      "description": "输入含外文时停顿 0.8 秒后台翻译，输入框上方显示英文；回车直接发出所见的英文。每个草稿最多请求一次",
+      "description": "输入含外文时停顿片刻（live_delay_ms）后台翻译，输入框上方完整显示英文；回车直接发出所见的英文，「编辑英文」可换进输入框修改。每个草稿最多请求一次",
       "default": true
+    },
+    "live_delay_ms": {
+      "type": "number",
+      "title": "实时预览停顿时间（毫秒）",
+      "description": "停止输入多久才开始翻译，默认 1500；打字时常停下来想的可以调大。范围 300–10000",
+      "default": 1500
     },
     "lang": {
       "type": "string",

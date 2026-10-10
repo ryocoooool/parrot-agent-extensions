@@ -22,7 +22,7 @@ const MAX_TOKENS = 16_000 // 单次补全输出上限：3000 字符块的重写�
 const MAP_CAP = 500 // cache / outboundMap 条目上限（FIFO 淘汰最旧，防长会话无限增长）
 
 /** userConfig 传入的配置（register 时初始化） */
-const cfg = { display: 'both', outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '', livePreview: true }
+const cfg = { display: 'both', outbound: true, lang: 'zh-Hans', provider: 'microsoft', model: 'haiku', baseUrl: 'http://127.0.0.1:8021/v1', apiKey: '', livePreview: true, liveDelay: 1500 }
 
 /**
  * 页面显示方式（/translate 循环切换；初始值来自 display 配置），用户消息与回复共用：
@@ -636,18 +636,78 @@ function scheduleOne($, text) {
     })
 }
 
-/** 从预览框填回输入框的英文 { orig }：下一次回车原样发出（用户可能又改过），不再二次改写 */
-let preview = null
+/**
+ * 审阅中的英文 { orig }：点「编辑英文」后英文替换了输入框里的草稿，orig 是原草稿。
+ * 回车原样发出输入框里的英文（用户可能改过），不再二次改写
+ */
+let review = null
 
 /* ---------------- 实时预览：输入时在输入框上方显示英文 ---------------- */
 
-const LIVE_DEBOUNCE = 800
+/** 停顿多久才翻（ms）：太短会在打字途中思考的间隙就去翻，预览跟着来回跳 */
+const LIVE_DELAY_DEFAULT = 1500
 /** 草稿 -> outboundBlock 结果 + state（done / same / error）；回车时命中就不再请求 */
 const liveCache = new Map()
 let liveDraft = '' // 正在预览的草稿；空 = 不显示
 let liveLast = '' // 最近一次译好的英文：新译文出来前先显示它，免得闪烁
 let liveTimer = null
 let liveRunning = false
+/** 「发送英文」经 $.prompt.submit 发出的文本：它的来源会被标成本插件，提交钩子据此改回用户本人 */
+let reviewSending = null
+/**
+ * 上方区域是否握着键盘（在选按钮），只用来换提示语：焦点落到本插件的按钮上时置真。
+ * Esc 交还键盘没有事件，所以握着期间每 300ms 探测一次（见 watchHold）
+ */
+let bandFocused = false
+const BAND_KEYS = ['live-edit', 'review-revert', 'review-send', 'review-save']
+let bandId = '' // 上方区域的 requestId，$.ui.focus 用
+let lastFocusKey = '' // 焦点最近落在哪个按钮上
+let holdTimer = null
+let probing = false // 探测本身也会触发 ui.focus，钩子据此不把它当成用户操作
+/** 探测用的、从不绘制的按钮名：握着键盘时引擎最多等 3 秒才拒绝，没握着时立刻拒绝 */
+const PROBE_KEY = '__parrot_probe__'
+
+/**
+ * 上方区域还握着键盘吗：请求聚焦本插件的按钮，没握着时引擎拒绝（that site does not hold the keyboard）。
+ * 用焦点当前所在的按钮探测：再聚焦一次原地不动、立刻有结果；不知道在哪个上就用从不绘制的 PROBE_KEY，握着时要等满 3 秒
+ */
+async function probeHold($, key) {
+  if (!bandId) return true
+  probing = true
+  try {
+    const r = await $.ui.focus({ requestId: bandId, key })
+    return !/does not hold/.test(r?.deny ?? '')
+  } catch {
+    return true
+  } finally {
+    probing = false
+  }
+}
+
+function drawnBandKeys() {
+  if (review) return ['review-revert', 'review-send', 'review-save']
+  return liveDraft && liveCache.get(liveDraft)?.state === 'done' ? ['live-edit'] : []
+}
+
+function setBandFocused($, focused) {
+  if (focused === bandFocused) return
+  bandFocused = focused
+  $.ui.invalidate('ui.render')
+  if (focused) watchHold($)
+  else if (holdTimer) { holdTimer.cancel(); holdTimer = null }
+}
+
+function watchHold($) {
+  if (holdTimer) holdTimer.cancel()
+  holdTimer = $.clock.after(300, async () => {
+    holdTimer = null
+    if (!bandFocused) return
+    const held = await probeHold($, drawnBandKeys().includes(lastFocusKey) ? lastFocusKey : PROBE_KEY)
+    if (!bandFocused) return
+    if (held) watchHold($)
+    else setBandFocused($, false)
+  })
+}
 
 /** 只预览含非拉丁文字的草稿（纯英文无需翻译）；斜杠命令不预览 */
 function onDraftEdit($, text) {
@@ -662,7 +722,7 @@ function onDraftEdit($, text) {
 }
 
 function armLive($) {
-  liveTimer = $.clock.after(LIVE_DEBOUNCE, () => { liveTimer = null; runLive($) })
+  liveTimer = $.clock.after(cfg.liveDelay, () => { liveTimer = null; runLive($) })
 }
 
 /** 同一时间只跑一次翻译（省额度）；跑完草稿又变了就重新防抖 */
@@ -689,37 +749,114 @@ function clearLive($) {
   onDraftEdit($, '')
 }
 
-/** 预览框里回车：把（手改过的）英文填进输入框，再回车原样发出 */
-async function fillFromLive($, draft, value) {
-  if (!value.trim()) return
-  const filled = await $.prompt.fill({ text: value, mode: 'replace' })
+/** 「编辑英文」（ctrl+x tab 落到它上面即触发，或点击）：英文替换输入框里的草稿，直接在输入框里改；上方换成原文 + 三个按钮 */
+async function startReview($) {
+  const draft = liveDraft
+  const r = liveCache.get(draft)
+  if (!draft || r?.state !== 'done') return
+  const filled = await $.prompt.fill({ text: r.text, mode: 'replace' })
   if (!filled.isFilled) return
-  preview = { orig: draft }
+  review = { orig: draft }
   clearLive($)
-  diag($, `live fill len=${draft.length} -> ${value.length}`)
-  $.ui.toast('英文已填入输入框，回车发送')
+  $.ui.invalidate('ui.render')
+  diag($, `review start len=${draft.length}`)
+  // 从上方区域进来的：「编辑英文」没了，焦点放到默认的「恢复原文」上（位置确定，探测才不用等；误按回车也不会发出）
+  if (bandFocused) {
+    lastFocusKey = 'review-revert'
+    if (!(await probeHold($, 'review-revert'))) setBandFocused($, false)
+  }
+}
+
+/** 输入框里（改过的）英文；改的时候又写进了外文就先照常转成英文 */
+async function reviewedEnglish($) {
+  let text = (await $.prompt.read()).text
+  if (text.trim() && nonLatinLetterCount(text)) {
+    const r = await outboundBlock($, text).catch(() => null)
+    if (r?.changed && r.text.trim()) text = r.text
+  }
+  return text
+}
+
+/** 「发送英文」：发出输入框里（改过的）英文 */
+async function sendReview($) {
+  if (!review) return
+  const { orig } = review
+  const text = await reviewedEnglish($)
+  if (!text.trim() || !review) return
+  review = null
+  $.ui.invalidate('ui.render')
+  await $.prompt.fill({ text: '', mode: 'replace' })
+  if (text.trim() !== orig.trim()) putOutboundMap(text, orig)
+  reviewSending = text
+  diag($, `review send len=${text.length}`)
+  await $.prompt.submit({ text }).catch((err) => {
+    diag($, `review send error: ${String((err && err.message) || err).slice(0, 150)}`)
+  })
+}
+
+/**
+ * 「保存译文」：改过的英文存成这份草稿的译文，输入框换回原草稿，上方预览显示改后的英文；
+ * 之后直接回车发出的就是它（草稿再改就重新翻译，回到同一份草稿仍用存下的译文）
+ */
+async function saveReview($) {
+  if (!review) return
+  const { orig } = review
+  const text = await reviewedEnglish($)
+  if (!text.trim() || !review) return
+  review = null
+  const prev = liveCache.get(orig)
+  putCapped(liveCache, orig, { ...prev, text, changed: true, state: 'done', edited: true })
+  await $.prompt.fill({ text: orig, mode: 'replace' })
+  onDraftEdit($, orig)
+  $.ui.invalidate('ui.render')
+  $.ui.toast('译文已保存，回车发送')
+  diag($, `review save len=${text.length}`)
+}
+
+/** 「恢复原文」：放弃英文和对它的修改，原草稿放回输入框（实时预览命中缓存，立刻显示英文） */
+async function revertReview($) {
+  if (!review) return
+  const { orig } = review
+  review = null
+  await $.prompt.fill({ text: orig, mode: 'replace' })
+  onDraftEdit($, orig)
+  $.ui.invalidate('ui.render')
 }
 
 function renderLive($, e, next) {
-  if (!liveDraft || e.props?.hasSurvey) return next(e)
+  if (e.props?.hasSurvey) return next(e)
+  bandId = e.requestId || bandId
+  const { Box, Text, Button } = $.ui.resolve(e)
+  if (review && Button) {
+    // 英文已在输入框里改；上方显示原文对照。ctrl+x tab 后按数字键或回车选，桌面端直接点
+    return h(Box, { flexDirection: 'column' },
+      h(Text, { dimColor: true, wrap: 'wrap' }, `原文 ▸ ${review.orig}`),
+      h(Box, { flexDirection: 'row', gap: 2 },
+        // 默认（autoFocus、排第一）是「恢复原文」：最不会出错的选项
+        h(Button, { key: 'review-revert', label: '恢复原文', hotkey: '1', plain: true, autoFocus: true, onPress: () => { void revertReview($) } }),
+        h(Button, { key: 'review-send', label: '发送英文', hotkey: '2', plain: true, onPress: () => { void sendReview($) } }),
+        h(Button, { key: 'review-save', label: '保存译文', hotkey: '3', plain: true, onPress: () => { void saveReview($) } }),
+        h(Text, { dimColor: true }, bandFocused ? 'Esc 回输入框修改' : 'ctrl+x tab 选择')))
+  }
+  if (!liveDraft) return next(e)
   const draft = liveDraft
   const r = liveCache.get(draft)
-  const { Box, Text, Input } = $.ui.resolve(e)
-  if (r?.state === 'done' && Input) {
-    // 手改随打随存进缓存：Esc 回输入框直接回车，发出的就是改过的英文
-    const hint = `ctrl+x tab 编辑英文 · 框内回车填入输入框 · Esc 返回${r.errors ? ` · ${r.errors} 段翻译失败，保留原文` : ''}`
+  if (r?.state === 'done' && Button) {
+    // 只读，完整显示自动换行，方便和草稿逐句对照
     return h(Box, { flexDirection: 'column' },
-      h(Input, {
-        key: 'live-en', label: 'EN ▸ ', value: r.text, submitLabel: '填入输入框', autoFocus: true,
-        onInput: (value) => { putCapped(liveCache, draft, { ...r, text: value, edited: true }) },
-        onSubmit: (value) => { void fillFromLive($, draft, value) },
-      }),
-      h(Text, { dimColor: true }, hint))
+      h(Text, { wrap: 'wrap' }, `EN ▸ ${r.text}${r.errors ? `（${r.errors} 段翻译失败，保留原文）` : ''}`),
+      h(Box, { flexDirection: 'row', gap: 2 },
+        h(Button, { key: 'live-edit', label: '编辑英文', plain: true, autoFocus: true, onPress: () => { void startReview($) } }),
+        h(Text, { dimColor: true }, 'ctrl+x tab 编辑 · 直接回车即发送这段英文')))
   }
   const body = !r ? (liveLast ? `${liveLast} …` : '翻译中…')
     : r.state === 'done' ? r.text
       : r.state === 'same' ? '（无需翻译，原样发送）' : '（英文预览失败，见 /tmp/pt-live.log）'
-  return h(Box, null, h(Text, { dimColor: true }, `EN ▸ ${body}`))
+  // 各状态都是两行，翻译中 <-> 译好来回切时预览框高度不变，不会上下跳
+  const status = !r ? (liveLast ? '草稿有改动，停顿后更新英文' : '停顿后翻译') : r.state === 'same' ? '回车原样发送' : '回车时会重试'
+  return h(Box, { flexDirection: 'column' },
+    h(Text, { dimColor: true, wrap: 'wrap' }, `EN ▸ ${body}`),
+    h(Text, { dimColor: true }, status))
 }
 
 function onRenderText($, text) {
@@ -739,7 +876,14 @@ export function register(on, options) {
   seen.clear()
   cache.clear()
   outboundMap.clear()
-  preview = null
+  review = null
+  reviewSending = null
+  bandFocused = false
+  bandId = ''
+  lastFocusKey = ''
+  probing = false
+  if (holdTimer) holdTimer.cancel()
+  holdTimer = null
   if (liveTimer) liveTimer.cancel()
   liveTimer = null
   liveCache.clear()
@@ -758,11 +902,13 @@ export function register(on, options) {
   cfg.baseUrl = typeof options?.base_url === 'string' && options.base_url.trim() ? options.base_url.trim() : 'http://127.0.0.1:8021/v1'
   cfg.apiKey = typeof options?.api_key === 'string' ? options.api_key : ''
   cfg.livePreview = options?.live_preview !== false
+  const delay = Number(options?.live_delay_ms)
+  cfg.liveDelay = Number.isFinite(delay) && delay > 0 ? Math.min(Math.max(Math.round(delay), 300), 10000) : LIVE_DELAY_DEFAULT
   mode = cfg.display
 
   on('session.start', async ($, e, next) => {
     outboundMap.clear()
-    preview = null
+    review = null
     await $.command.register({ name: 'translate', description: 'Cycle the display of prompts and replies: bilingual, your language only, English only', argumentHint: '[both|native|english]' })
     diag($, `loaded provider=${cfg.provider} model=${cfg.model} baseUrl=${cfg.baseUrl} display=${cfg.display} outbound=${cfg.outbound} lang=${cfg.lang}`)
     return next(e)
@@ -801,32 +947,57 @@ export function register(on, options) {
     return next({ ...e, props: { ...e.props, text: mode === 'native' ? entry.native : entry.md } })
   })
 
-  // 输入时更新实时预览；输入框清空即放弃已填入的英文预览（之后的提交回到自动改写）
+  // 输入时更新实时预览；审阅英文时清空输入框就是放弃审阅（之后的提交回到自动改写）
   on('prompt.edit', async ($, e, next) => {
     const r = await next(e)
     const text = r?.text ?? ''
-    if (!text.trim()) preview = null
+    setBandFocused($, false)
+    if (!text.trim() && review) {
+      review = null
+      $.ui.invalidate('ui.render')
+    }
     onDraftEdit($, text)
     return r
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => renderLive($, e, next))
 
+  // 焦点落到本插件的按钮上 = 正在上方选择（换提示语）；落到「编辑英文」（它是唯一的按钮，autoFocus）就直接开始编辑，省一次回车
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const r = await next(e)
+    if (r?.deny || probing) return r
+    if (BAND_KEYS.includes(e.element)) lastFocusKey = e.element
+    setBandFocused($, BAND_KEYS.includes(e.element))
+    if (e.element === 'live-edit') void startReview($)
+    return r
+  })
+
+  // 「发送英文」走 $.prompt.submit，来源被标成本插件；改回用户本人，模型照常当用户的话读
+  on('prompt.submit', { origin: { kind: 'plugin' } }, async ($, e, next) => {
+    if (reviewSending === null || e.text !== reviewSending) return next(e)
+    reviewSending = null
+    const r = await next(e)
+    if (r?.drop !== undefined) return r
+    const { origin, ...rest } = r
+    return rest
+  })
+
   // 出站：本机敲 Enter 的提示词改写成英文再进会话（插件/peer/通知的提交不动）
   on('prompt.submit', { origin: { kind: 'composer' } }, async ($, e, next) => {
     const text = e.text ?? ''
     if (text.startsWith('/')) return next(e)
-    const reviewed = preview
-    preview = null
+    const reviewed = review
+    review = null
+    setBandFocused($, false)
     const live = liveCache.get(text)
     clearLive($)
-    // 预览过的英文（可能已手改）原样发出；改的时候又写进了非拉丁文字就照常走自动改写
+    // 审阅过的英文（可能已手改）原样发出；改的时候又写进了非拉丁文字就照常走自动改写
     if (reviewed && text.trim() && !nonLatinLetterCount(text)) {
       if (text.trim() !== reviewed.orig.trim()) putOutboundMap(text, reviewed.orig)
       diag($, `outbound reviewed len=${text.length}`)
       return next(e)
     }
-    // outbound 关掉时只认用户在预览框里手改过的英文（明确要发英文），不做自动改写
+    // outbound 关掉时不做自动改写，只认用户审阅后保存的译文（明确要发英文）
     if ((!cfg.outbound && !live?.edited) || !text.trim()) return next(e)
     try {
       // 实时预览已译好：发出的就是输入框上方显示的英文，不再请求
