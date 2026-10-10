@@ -1,8 +1,10 @@
 # parrot-translate (Claude Code)
 
+> 本分支基于 [jhao0413/parrot-agent-extensions](https://github.com/jhao0413/parrot-agent-extensions) 修改，改动见[根 README](../../README.md#本分支的改动claude-code)。感谢原作者 [jhao0413](https://github.com/jhao0413)。
+
 写给想用英文跟模型对话的非英语用户。
 
-Claude 的英文回复在后台翻成你配置的语言，译文跟在对应的原文段落后面。你输入的提示词在发出前会被改写成英文：是外文就翻译，已经是英文就只修语法，意思不变。发出后保留原文和英文的对照。`/translate` 在「双语对照 / 只显示中文 / 只显示英文」之间切换整个页面。
+Claude 的英文回复在后台翻成你配置的语言，译文跟在对应的原文段落后面。你输入的提示词在发出前会被改写成英文：是外文就翻译，已经是英文就只修语法，意思不变。发出后保留原文和英文的对照。`/translate` 在「双语对照 / 只显示中文 / 只显示英文」之间切换整个页面。输入时输入框上方实时显示完整英文，`ctrl+x tab` 可以把英文换进输入框改好再发。
 
 译文和对照都只在显示层，整个对话上下文里始终只有英文。
 
@@ -12,47 +14,64 @@ Claude 的英文回复在后台翻成你配置的语言，译文跟在对应的�
 
 ### 安装
 
-```bash
-claude plugin marketplace add ryocoooool/parrot-agent-extensions
-claude plugin install parrot-translate@parrot-agent-extensions
-```
+1. 添加本分支的 marketplace：
+   ```bash
+   claude plugin marketplace add ryocoooool/parrot-agent-extensions
+   ```
+2. 安装插件：
+   ```bash
+   claude plugin install parrot-translate@parrot-agent-extensions
+   ```
+3. 开一个新会话，插件即生效。默认配置（微软翻译、目标语言简体中文）无需改动就能用，要调整见下面的「配置」，配置键是 `parrot-translate@parrot-agent-extensions`
 
-marketplace 名是 `parrot-agent-extensions`，与上游 `jhao0413/parrot-agent-extensions` 同名。之前添加过上游的，先移除再添加，否则装到的是上游版本：
+本分支的 marketplace 名与上游 `jhao0413/parrot-agent-extensions` 相同。之前添加过上游的，先移除再执行第 1 步，否则装到的是上游版本：
 
 ```bash
 claude plugin marketplace remove parrot-agent-extensions
 ```
 
-装好后在新会话里生效。配置键是 `parrot-translate@parrot-agent-extensions`，见下面的「配置」。
-
 ### 更新
 
-先刷新 marketplace，再更新插件，然后重开会话：
+1. 刷新 marketplace：
+   ```bash
+   claude plugin marketplace update parrot-agent-extensions
+   ```
+2. 更新插件：
+   ```bash
+   claude plugin update parrot-translate@parrot-agent-extensions
+   ```
+3. 开新会话，已打开的会话仍是旧版本
 
-```bash
-claude plugin marketplace update parrot-agent-extensions
-claude plugin update parrot-translate@parrot-agent-extensions
-```
+各版本需要注意的变化：
 
-0.2.0 起 `show_by_default` 被 `display` 取代：原来设为 `false` 的，改成 `"display": "english"`。
+- **0.3.0**：输入框上方的英文改为只读并完整显示；修改英文改为 `ctrl+x tab` 换进主输入框里改（恢复原文 / 发送英文 / 保存译文）；新增 `live_delay_ms`，实时预览默认停顿 1.5 秒才翻
+- **0.2.0**：`show_by_default` 被 `display` 取代，原来设为 `false` 的改成 `"display": "english"`
 
-### 本地开发
+### 本地开发与测试
 
-改仓库里的代码时，不用安装，直接从目录加载（改动在下次启动生效）：
+改仓库里的代码时不用安装，直接从目录加载（改动在下次启动生效，配置键是 `parrot-translate@inline`）：
 
 ```bash
 claude --plugin-dir /path/to/parrot-agent-extensions/claude/parrot-translate
 ```
 
-这种方式的配置键是 `parrot-translate@inline`。和 marketplace 版同时启用时会加载两份，测试时先 `claude plugin disable parrot-translate@parrot-agent-extensions`。
+已经装了 marketplace 版的，两份会同时加载。只在这个会话里关掉 marketplace 版，不影响其他会话：
+
+```bash
+claude --plugin-dir /path/to/parrot-agent-extensions/claude/parrot-translate --settings '{"enabledPlugins":{"parrot-translate@parrot-agent-extensions":false}}'
+```
+
+`claude plugin disable parrot-translate@parrot-agent-extensions` 也行，但它改的是全局设置，之后新开的会话（包括桌面端）都会没有插件，测完记得 `claude plugin enable` 回来。
 
 ### 发布新版本
 
-1. 改 `.claude-plugin/plugin.json` 的 `version`（已安装的机器靠版本号识别更新，不改可能拿不到新代码）
+1. 改 `.claude-plugin/plugin.json` 的 `version`（已安装的机器靠版本号识别更新，不改的话 `claude plugin update` 拿不到新代码）
 2. 跑测试和校验：
    ```bash
    (cd pi && npm install && npm test)
-   claude plugin validate .
+   ```
+   ```bash
+   claude plugin validate claude/parrot-translate
    ```
 3. 提交并推送到 `main`，其他机器按上面的「更新」执行
 
@@ -82,7 +101,8 @@ claude --plugin-dir /path/to/parrot-agent-extensions/claude/parrot-translate
 |---|---|---|
 | `display` | `both` | 页面显示方式，用户消息和回复共用：`both` 双语对照、`native` 只显示你的语言、`english` 只显示英文，见「显示方式」。取代旧的 `show_by_default`（原来设为 `false` 的改成 `english`） |
 | `outbound` | `true` | 出站链路总开关 |
-| `live_preview` | `true` | 输入时在输入框上方显示可编辑的英文，见「实时预览与修改」 |
+| `live_preview` | `true` | 输入时在输入框上方显示完整英文，可一键换进输入框修改，见「实时预览与修改」 |
+| `live_delay_ms` | `1500` | 停止输入多久才开始实时翻译（300–10000）；打字时常停下来想的可以调大 |
 | `lang` | `zh-Hans` | 你的语言，微软语言码：`zh-Hant`、`ja`、`ko`、`fr`、`de`、`es`、`ru` 等 |
 | `provider` | `microsoft` | 翻译服务，见下 |
 | `model` | `haiku` | `session` / `openai` 用的模型；填别名 haiku / sonnet 或完整 id |
@@ -142,22 +162,27 @@ provider 三选一：
 
 ## 实时预览与修改（发送前改英文）
 
-输入框里出现中文等非拉丁文字时，停顿 0.8 秒后在后台翻译，输入框上方显示 `EN ▸` 英文。继续输入时先保留上一版英文（末尾带 `…`），新译文出来后替换。
+输入框里出现中文等非拉丁文字时，停顿 1.5 秒（`live_delay_ms`）后在后台翻译，输入框上方完整显示 `EN ▸` 英文（只读，长句自动换行）。继续输入时先保留上一版英文（末尾带 `…`），新译文出来后替换。直接回车，发出的就是上方这段英文。
 
-译好的英文是一个可编辑的输入框：
+想先改英文再发：
 
-1. 按 `ctrl+x tab`（Claude Code 默认的「聚焦输入框上方区域」）或点一下，光标直接进入英文框
-2. 直接修改英文，改动随打随存
-3. 两种发送方式：
-   - `Esc` 回到输入框，回车：发出的就是你改过的英文
-   - 在英文框里回车：英文填进输入框（中文草稿被替换），再看一眼，回车原样发出
+1. 按 `ctrl+x tab`（Claude Code 默认的「聚焦输入框上方区域」），或直接点「编辑英文」
+2. 英文替换掉输入框里的草稿，上方改为显示 `原文 ▸` 对照，并给出三个选项
+3. 按 `Esc` 回到输入框，直接改英文
+4. 改完后：
+   - 「1 恢复原文」（默认，`ctrl+x tab` 后焦点在它上面）：放弃英文和修改，原草稿放回输入框
+   - 在输入框里回车，或「2 发送英文」：原样发出输入框里的英文
+   - 「3 保存译文」：改后的英文存为这份草稿的译文，输入框换回原草稿，上方预览显示改后的英文；之后直接回车发出的就是它
 
 细节：
 
-- 回车时草稿和预览的一致，就直接发出上方的英文（含手改），不再请求，所见即所发；用户消息行照样显示「原文在上、发出的英文在下」
-- 改了中文草稿，预览会重新翻译，之前对英文的手改作废
-- 填进输入框的英文只管下一次发送：清空输入框就作废；编辑时又写进中文等非拉丁文字，回车会照常走自动改写
-- `outbound` 关掉时不做自动改写，但在预览框里手改过的英文、或从预览框填进输入框的英文，仍按英文发出
+- 选项需要先 `ctrl+x tab` 聚焦上方区域，再按数字键或方向键 + 回车；桌面端可直接点
+- 上方的提示随键盘位置变化：在输入框时提示 `ctrl+x tab`，在上方选择时提示 `Esc` 返回。`Esc` 交还键盘时插件收不到通知，所以在上方选择期间每 300ms 探测一次焦点，按 `Esc` 后提示约 0.3 秒内换回来
+- 发出的英文不再二次改写；用户消息行照样显示「原文在上、发出的英文在下」
+- 改英文时又写进了中文等非拉丁文字，发送时会照常转成英文
+- 审阅时清空输入框就是放弃审阅，之后的提交回到自动改写
+- 保存的译文跟着草稿走：草稿再改会重新翻译，改回同一份草稿仍用保存的译文
+- `outbound` 关掉时不做自动改写，但审阅过的英文（在输入框里发出的、或「保存译文」存下的）仍按英文发出
 - 纯英文、斜杠命令、空输入不预览，也不请求
 - 每个草稿最多请求一次（有缓存），同一时间只跑一个翻译请求，连续输入只翻最后停下来的版本
 - 预览失败会在上方提示，回车时照常重试
@@ -186,6 +211,15 @@ provider 三选一：
 
 ## 卸载
 
-- marketplace 装的：`claude plugin uninstall parrot-translate@parrot-agent-extensions`
-- 从 `~/.claude/settings.json` 的 `pluginConfigs` 删掉 `parrot-translate@parrot-agent-extensions`（如有）；`claude plugin marketplace remove parrot-agent-extensions` 移除源
-- 从 `~/.claude/keybindings.json` 删掉 `command:translate` 的绑定（如有）；删掉 `pluginConfigs` 里的 `parrot-translate@parrot-agent-extensions`（如有）
+1. 卸载插件：
+   ```bash
+   claude plugin uninstall parrot-translate@parrot-agent-extensions
+   ```
+2. 移除 marketplace（不再需要本分支的源时）：
+   ```bash
+   claude plugin marketplace remove parrot-agent-extensions
+   ```
+3. 按需清理残留配置：
+   - `~/.claude/settings.json` 里 `pluginConfigs` 下的 `parrot-translate@parrot-agent-extensions`，本地开发用过的还有 `parrot-translate@inline`
+   - `~/.claude/keybindings.json` 里 `command:translate` 的绑定
+   - 诊断日志 `/tmp/pt-live.log`
